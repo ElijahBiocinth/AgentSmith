@@ -1,13 +1,11 @@
 """
 Ouroboros — LLM client.
 
-OpenAI-only edition (no OpenRouter).
-Contract:
-- chat()
-- vision_query()
-- default_model()
-- available_models()
-- add_usage()
+Multi-provider edition (no OpenRouter).
+- Primary agent + tools are expected to run on OpenAI (best compatibility).
+- Other providers (DeepSeek/Qwen/HF/vLLM) can be used for fallback and review.
+
+This module must remain the single place that talks to LLM APIs.
 """
 from __future__ import annotations
 
@@ -15,13 +13,14 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.providers import parse_model_id, get_provider
+
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "gpt-5-mini"
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
-    # kept for compatibility with callers; OpenAI Chat Completions may ignore it
     allowed = {"none", "minimal", "low", "medium", "high", "xhigh"}
     v = str(value or "").strip().lower()
     return v if v in allowed else default
@@ -37,57 +36,57 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
     for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_write_tokens"):
         total[k] = int(total.get(k) or 0) + int(usage.get(k) or 0)
 
-    # OpenAI responses typically won't include monetary cost in the API response.
-    # We keep 'cost' optional so supervisor budget logic doesn't crash.
+    # Monetary cost is generally not returned by OpenAI-compatible endpoints.
     if usage.get("cost"):
         total["cost"] = float(total.get("cost") or 0) + float(usage["cost"])
 
 
 class LLMClient:
-    """OpenAI API wrapper. All LLM calls go through this class."""
+    """OpenAI-compatible multi-provider wrapper."""
 
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
-        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
-        if not self._api_key.strip():
-            raise RuntimeError("OPENAI_API_KEY is not set (required).")
-        self._base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
-        self._client = None
+    def __init__(self):
+        # Require OPENAI_API_KEY because core agent + web_search expect OpenAI tooling
+        if not os.environ.get("OPENAI_API_KEY", "").strip():
+            raise RuntimeError("OPENAI_API_KEY is not set (required for core agent/web_search).")
 
-    def _get_client(self):
-        if self._client is None:
-            from openai import OpenAI
+    def _client_for(self, provider: str):
+        """Create an OpenAI SDK client for a given provider (OpenAI-compatible)."""
+        base_url, api_key = get_provider(provider)
+        from openai import OpenAI
+        return OpenAI(api_key=api_key, base_url=base_url)
 
-            # For OpenAI API, do not set OpenRouter headers.
-            self._client = OpenAI(api_key=self._api_key, base_url=self._base_url)
-        return self._client
-
-    def chat(
+    def chat_any(
         self,
         messages: List[Dict[str, Any]],
-        model: str,
+        model_id: str,
         tools: Optional[List[Dict[str, Any]]] = None,
         reasoning_effort: str = "medium",
         max_tokens: int = 8192,
         tool_choice: str = "auto",
+        temperature: float = 0.2,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Single LLM call. Returns: (response_message_dict, usage_dict).
-        Note: OpenAI API does not return dollar cost by default; usage['cost'] is omitted.
+        Call OpenAI-compatible /chat/completions on provider implied by model_id.
+        model_id examples:
+          - "gpt-5.2"
+          - "deepseek:deepseek-chat"
+          - "qwen:qwen-max"
+          - "hf:Qwen/Qwen2.5-Coder-32B-Instruct"
         """
-        client = self._get_client()
+        provider, model = parse_model_id(model_id)
+        client = self._client_for(provider)
 
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
+            "temperature": temperature,
         }
 
-        # Tool calling (Chat Completions format)
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
 
-        # Some models/endpoints support reasoning settings; Chat Completions may ignore.
         _ = normalize_reasoning_effort(reasoning_effort)
 
         resp = client.chat.completions.create(**kwargs)
@@ -97,7 +96,7 @@ class LLMClient:
         choices = resp_dict.get("choices") or [{}]
         msg = (choices[0] if choices else {}).get("message") or {}
 
-        # Keep cached/cache_write tokens if they exist (usually absent on OpenAI chat completions)
+        # Optional cached tokens extraction (provider-dependent)
         if not usage.get("cached_tokens"):
             prompt_details = usage.get("prompt_tokens_details") or {}
             if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
@@ -116,6 +115,84 @@ class LLMClient:
 
         return msg, usage
 
+    def chat_with_fallbacks(
+        self,
+        messages: List[Dict[str, Any]],
+        primary_model_id: str,
+        fallback_list_csv: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 8192,
+        tool_choice: str = "auto",
+        temperature: float = 0.2,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Try primary → fallback chain on:
+          - exception
+          - empty content (content is missing or blank)
+        fallback_list_csv example:
+          "gpt-5-mini,deepseek:deepseek-chat,qwen:qwen-max"
+        """
+        models = [primary_model_id] + [m.strip() for m in (fallback_list_csv or "").split(",") if m.strip()]
+        last_err = None
+
+        for mid in models:
+            try:
+                msg, usage = self.chat_any(
+                    messages=messages,
+                    model_id=mid,
+                    tools=tools,
+                    reasoning_effort=reasoning_effort,
+                    max_tokens=max_tokens,
+                    tool_choice=tool_choice,
+                    temperature=temperature,
+                )
+                content = msg.get("content")
+                if content is None or (isinstance(content, str) and not content.strip()):
+                    last_err = f"Empty response from {mid}"
+                    continue
+                return msg, usage
+            except Exception as e:
+                last_err = f"{mid}: {e}"
+                continue
+
+        raise RuntimeError(f"All models failed. Last error: {last_err}")
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 8192,
+        tool_choice: str = "auto",
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Backward-compatible entrypoint used by the rest of Ouroboros.
+        Uses OUROBOROS_MODEL_FALLBACK_LIST if present.
+        """
+        fallbacks = os.environ.get("OUROBOROS_MODEL_FALLBACK_LIST", "").strip()
+        if fallbacks:
+            return self.chat_with_fallbacks(
+                messages=messages,
+                primary_model_id=model,
+                fallback_list_csv=fallbacks,
+                tools=tools,
+                reasoning_effort=reasoning_effort,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+                temperature=0.2,
+            )
+        return self.chat_any(
+            messages=messages,
+            model_id=model,
+            tools=tools,
+            reasoning_effort=reasoning_effort,
+            max_tokens=max_tokens,
+            tool_choice=tool_choice,
+            temperature=0.2,
+        )
+
     def vision_query(
         self,
         prompt: str,
@@ -125,10 +202,8 @@ class LLMClient:
         reasoning_effort: str = "low",
     ) -> Tuple[str, Dict[str, Any]]:
         """
-        Vision query via Chat Completions multimodal content.
-        Each image dict must be either:
-          - {"url": "https://..."}
-          - {"base64": "...", "mime": "image/png"}
+        Vision query via OpenAI-compatible Chat Completions multimodal content.
+        For non-OpenAI providers, support may vary.
         """
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for img in images:
@@ -147,16 +222,15 @@ class LLMClient:
             tools=None,
             reasoning_effort=reasoning_effort,
             max_tokens=max_tokens,
+            tool_choice="auto",
         )
         text = response_msg.get("content") or ""
         return text, usage
 
     def default_model(self) -> str:
-        """Return the single default model from env. LLM switches via tool if needed."""
         return os.environ.get("OUROBOROS_MODEL", "gpt-5.2")
 
     def available_models(self) -> List[str]:
-        """Return list of available models from env (for switch_model tool schema)."""
         main = os.environ.get("OUROBOROS_MODEL", "gpt-5.2")
         code = os.environ.get("OUROBOROS_MODEL_CODE", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
