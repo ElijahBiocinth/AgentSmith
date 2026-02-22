@@ -1,7 +1,7 @@
 """
 Multi-model review tool — multi-provider (OpenAI-compatible).
 
-This is best used for "critic/consensus" where tool-calling is NOT required.
+Best used for critic/consensus where tool-calling is NOT required.
 Primary agent should remain OpenAI for stable tool integration.
 """
 import os
@@ -34,13 +34,9 @@ def get_tools():
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "content": {"type": "string", "description": "The code or text to review"},
-                        "prompt": {"type": "string", "description": "Review instructions. Make them explicit."},
-                        "models": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of model ids. Supports 'prov:model' prefix.",
-                        },
+                        "content": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "models": {"type": "array", "items": {"type": "string"}},
                     },
                     "required": ["content", "prompt", "models"],
                 },
@@ -57,7 +53,6 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
         try:
             asyncio.get_running_loop()
             import concurrent.futures
-
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(asyncio.run, _multi_model_review_async(content, prompt, models, ctx)).result()
         except RuntimeError:
@@ -99,19 +94,13 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
         return {"error": "prompt is required"}
     if not models:
         return {"error": "models list is required"}
-    if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
-        return {"error": "models must be a list of strings"}
     if len(models) > MAX_MODELS:
         return {"error": f"Too many models requested ({len(models)}). Maximum is {MAX_MODELS}."}
 
-    # Require OPENAI_API_KEY at least, because the rest of system depends on it
     if not os.environ.get("OPENAI_API_KEY", "").strip():
         return {"error": "OPENAI_API_KEY not set (required by system)."}
 
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": content},
-    ]
+    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": content}]
 
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     async with httpx.AsyncClient() as client:
@@ -120,56 +109,40 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
 
     review_results = []
     for model_id, result, headers_dict in results:
-        review_result = _parse_model_response(model_id, result, headers_dict)
+        review_result = _parse_model_response(model_id, result)
         _emit_usage_event(review_result, ctx)
         review_results.append(review_result)
 
     return {"model_count": len(models), "results": review_results}
 
 
-def _parse_model_response(model_id: str, result, headers_dict) -> dict:
+def _parse_model_response(model_id: str, result) -> dict:
     if isinstance(result, str):
-        return {
-            "model": model_id,
-            "verdict": "ERROR",
-            "text": result,
-            "tokens_in": 0,
-            "tokens_out": 0,
-            "cost_estimate": 0.0,
-        }
+        return {"model": model_id, "verdict": "ERROR", "text": result, "tokens_in": 0, "tokens_out": 0}
 
     try:
         choices = result.get("choices", [])
-        if not choices:
-            text = f"(no choices in response: {json.dumps(result)[:200]})"
-            verdict = "ERROR"
-        else:
-            text = choices[0]["message"]["content"]
-            verdict = "UNKNOWN"
-            for line in str(text).split("\n")[:3]:
-                u = line.upper()
-                if "PASS" in u:
-                    verdict = "PASS"
-                    break
-                if "FAIL" in u:
-                    verdict = "FAIL"
-                    break
+        text = choices[0]["message"]["content"] if choices else ""
     except Exception:
-        error_text = json.dumps(result)[:200] + (" [truncated]" if len(json.dumps(result)) > 200 else "")
-        text = f"(unexpected response format: {error_text})"
-        verdict = "ERROR"
+        text = ""
+
+    verdict = "UNKNOWN"
+    for line in str(text).split("\n")[:3]:
+        u = line.upper()
+        if "PASS" in u:
+            verdict = "PASS"
+            break
+        if "FAIL" in u:
+            verdict = "FAIL"
+            break
 
     usage = result.get("usage", {}) or {}
-    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-
     return {
         "model": model_id,
         "verdict": verdict,
         "text": text,
-        "tokens_in": prompt_tokens,
-        "tokens_out": completion_tokens,
-        "cost_estimate": 0.0,
+        "tokens_in": int(usage.get("prompt_tokens", 0) or 0),
+        "tokens_out": int(usage.get("completion_tokens", 0) or 0),
     }
 
 
