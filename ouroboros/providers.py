@@ -43,7 +43,7 @@ def parse_model_id(model_id: str) -> Tuple[str, str]:
       1) "gpt-5.2"                     -> ("openai", "gpt-5.2")
       2) "deepseek:deepseek-chat"      -> ("deepseek", "deepseek-chat")
       3) "qwen:qwen-max"               -> ("qwen", "qwen-max")
-      4) "hf:Qwen/Qwen2.5-Coder-32B..."-> ("hf", "Qwen/Qwen2.5-Coder-32B...")
+      4) "hf:Org/Model"                -> ("hf", "Org/Model")
     """
     s = (model_id or "").strip()
     if ":" in s:
