@@ -1,8 +1,8 @@
 """
-Multi-model review tool — OpenAI-only edition.
+Multi-model review tool — multi-provider (OpenAI-compatible).
 
-Sends content+prompt to multiple OpenAI models for independent review and returns
-structured verdicts. Budget tracking emits llm_usage events (tokens only; cost=0.0).
+This is best used for "critic/consensus" where tool-calling is NOT required.
+Primary agent should remain OpenAI for stable tool integration.
 """
 import os
 import json
@@ -12,12 +12,12 @@ import httpx
 
 from ouroboros.utils import utc_now_iso
 from ouroboros.tools.registry import ToolEntry, ToolContext
+from ouroboros.providers import parse_model_id, get_provider
 
 log = logging.getLogger(__name__)
 
 MAX_MODELS = 10
 CONCURRENCY_LIMIT = 5
-OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 
 def get_tools():
@@ -27,19 +27,19 @@ def get_tools():
             schema={
                 "name": "multi_model_review",
                 "description": (
-                    "Send code or text to multiple OpenAI models for review/consensus. "
-                    "Each model reviews independently. Returns structured verdicts. "
-                    "Choose diverse models yourself. Budget is tracked automatically (tokens only)."
+                    "Send code/text to multiple models (multi-provider) for independent review. "
+                    "Models can be plain 'gpt-5.2' or prefixed 'deepseek:deepseek-chat', "
+                    "'qwen:qwen-max', 'hf:org/model'. Returns structured verdicts."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "The code or text to review"},
-                        "prompt": {"type": "string", "description": "Review instructions — fully specified by the LLM"},
+                        "prompt": {"type": "string", "description": "Review instructions. Make them explicit."},
                         "models": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "OpenAI model identifiers to query (e.g. ['gpt-5.2','gpt-5-mini'])",
+                            "description": "List of model ids. Supports 'prov:model' prefix.",
                         },
                     },
                     "required": ["content", "prompt", "models"],
@@ -68,37 +68,28 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
 
 
-async def _query_model(client, model, messages, api_key, semaphore):
+async def _query_model(client, model_id, messages, semaphore):
     async with semaphore:
+        prov, mdl = parse_model_id(model_id)
         try:
+            base_url, api_key = get_provider(prov)
+            url = base_url.rstrip("/") + "/chat/completions"
             resp = await client.post(
-                OPENAI_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                },
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": mdl, "messages": messages, "temperature": 0.2},
                 timeout=120.0,
             )
-            status_code = resp.status_code
-            response_text = resp.text
-            response_headers = dict(resp.headers)
-
-            if status_code != 200:
-                err = response_text[:200] + (" [truncated]" if len(response_text) > 200 else "")
-                return model, f"HTTP {status_code}: {err}", None
-
-            data = resp.json()
-            return model, data, response_headers
+            if resp.status_code != 200:
+                t = resp.text
+                err = t[:200] + (" [truncated]" if len(t) > 200 else "")
+                return model_id, f"HTTP {resp.status_code}: {err}", None
+            return model_id, resp.json(), dict(resp.headers)
         except asyncio.TimeoutError:
-            return model, "Error: Timeout after 120s", None
+            return model_id, "Error: Timeout after 120s", None
         except Exception as e:
-            error_msg = str(e)[:200] + (" [truncated]" if len(str(e)) > 200 else "")
-            return model, f"Error: {error_msg}", None
+            s = str(e)
+            return model_id, f"Error: {s[:200] + (' [truncated]' if len(s) > 200 else '')}", None
 
 
 async def _multi_model_review_async(content: str, prompt: str, models: list, ctx: ToolContext):
@@ -107,15 +98,15 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     if not prompt:
         return {"error": "prompt is required"}
     if not models:
-        return {"error": "models list is required (e.g. ['gpt-5.2','gpt-5-mini'])"}
+        return {"error": "models list is required"}
     if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
         return {"error": "models must be a list of strings"}
     if len(models) > MAX_MODELS:
         return {"error": f"Too many models requested ({len(models)}). Maximum is {MAX_MODELS}."}
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return {"error": "OPENAI_API_KEY not set"}
+    # Require OPENAI_API_KEY at least, because the rest of system depends on it
+    if not os.environ.get("OPENAI_API_KEY", "").strip():
+        return {"error": "OPENAI_API_KEY not set (required by system)."}
 
     messages = [
         {"role": "system", "content": prompt},
@@ -124,22 +115,22 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
 
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     async with httpx.AsyncClient() as client:
-        tasks = [_query_model(client, m, messages, api_key, semaphore) for m in models]
+        tasks = [_query_model(client, m, messages, semaphore) for m in models]
         results = await asyncio.gather(*tasks)
 
     review_results = []
-    for model, result, headers_dict in results:
-        review_result = _parse_model_response(model, result, headers_dict)
+    for model_id, result, headers_dict in results:
+        review_result = _parse_model_response(model_id, result, headers_dict)
         _emit_usage_event(review_result, ctx)
         review_results.append(review_result)
 
     return {"model_count": len(models), "results": review_results}
 
 
-def _parse_model_response(model: str, result, headers_dict) -> dict:
+def _parse_model_response(model_id: str, result, headers_dict) -> dict:
     if isinstance(result, str):
         return {
-            "model": model,
+            "model": model_id,
             "verdict": "ERROR",
             "text": result,
             "tokens_in": 0,
@@ -155,7 +146,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
         else:
             text = choices[0]["message"]["content"]
             verdict = "UNKNOWN"
-            for line in text.split("\n")[:3]:
+            for line in str(text).split("\n")[:3]:
                 u = line.upper()
                 if "PASS" in u:
                     verdict = "PASS"
@@ -173,7 +164,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
     completion_tokens = int(usage.get("completion_tokens", 0) or 0)
 
     return {
-        "model": model,
+        "model": model_id,
         "verdict": verdict,
         "text": text,
         "tokens_in": prompt_tokens,
@@ -188,19 +179,19 @@ def _emit_usage_event(review_result: dict, ctx: ToolContext) -> None:
     usage_event = {
         "type": "llm_usage",
         "ts": utc_now_iso(),
-        "task_id": ctx.task_id if ctx.task_id else "",
+        "task_id": getattr(ctx, "task_id", "") or "",
         "usage": {
-            "prompt_tokens": review_result["tokens_in"],
-            "completion_tokens": review_result["tokens_out"],
-            "cost": 0.0,  # OpenAI doesn't provide per-call cost in response
+            "prompt_tokens": int(review_result.get("tokens_in", 0) or 0),
+            "completion_tokens": int(review_result.get("tokens_out", 0) or 0),
+            "cost": 0.0,
         },
         "category": "review",
     }
-    if ctx.event_queue is not None:
+    if getattr(ctx, "event_queue", None) is not None:
         try:
             ctx.event_queue.put_nowait(usage_event)
+            return
         except Exception:
-            if hasattr(ctx, "pending_events"):
-                ctx.pending_events.append(usage_event)
-    elif hasattr(ctx, "pending_events"):
+            pass
+    if hasattr(ctx, "pending_events"):
         ctx.pending_events.append(usage_event)
